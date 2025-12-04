@@ -17,7 +17,7 @@ except ImportError:  # pragma: no cover - dependency guard
     class OpenAIError(Exception):
         ...
 
-DEFAULT_OPENAI_KEY = os.getenv("OPENAI_API_KEY", "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")
+DEFAULT_OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
 
 
 class NaturalLanguageHelper:
