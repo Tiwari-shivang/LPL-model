@@ -365,3 +365,33 @@ class NaturalLanguageHelper:
             return resp.choices[0].message.content.strip()
         except (OpenAIError, asyncio.TimeoutError, Exception):
             return "Unable to answer cash follow-up right now. Please try again shortly."
+
+    async def position_reason(self, position_row: Dict[str, Any]) -> str:
+        """
+        Generate a one-line anomaly reason for a position row.
+        """
+        if self.client is None:
+            return "Reason unavailable (LLM not configured)."
+
+        prompt = (
+            "Given an account position object, analyze all fields and generate a one-line anomaly reason containing digits "
+            "and mandatory keywords (Drift, Overweight, Underweight, Timing Mismatch, Allocation Excess, Order Mismatch). "
+            "The sentence must briefly explain why the anomaly occurred using numeric fields such as model_target_percent, "
+            "executed_percent, drift_percent, overweight_percent, underweight_percent, timestamps, and flags. "
+            "Output must be 1 sentence only, include digits, and stay under 25 words. "
+            f"Here is the data: {json.dumps(position_row, default=str)}"
+        )
+
+        try:
+            resp = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "system", "content": prompt}],
+                temperature=0.1,
+            )
+            if resp and resp.choices and resp.choices[0].message.content:
+                return resp.choices[0].message.content.strip()
+            return "Reason generation failed; empty response."
+        except (OpenAIError, asyncio.TimeoutError) as exc:
+            return f"Reason generation failed: {exc}"
+        except Exception:
+            return "Reason generation failed; please retry."

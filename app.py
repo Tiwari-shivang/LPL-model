@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -20,6 +21,7 @@ from starlette.concurrency import run_in_threadpool
 from core.cash_intelligence import build_cash_intelligence
 from core.natural_language import NaturalLanguageHelper
 from core.master_agent import load_master_model, score_master_agent
+from core.position_model import load_position_model
 from db.database_client import DatabaseClient
 from feature_extractor import FEATURE_COLUMNS, extract_feature_matrix
 
@@ -67,6 +69,31 @@ class CashFollowUpRequest(BaseModel):
         extra = "allow"
 
 
+def _load_position_features(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    if "order_execution_time" in df.columns and "model_change_time" in df.columns:
+        df["order_execution_time"] = pd.to_datetime(df["order_execution_time"])
+        df["model_change_time"] = pd.to_datetime(df["model_change_time"])
+        df["time_delta_seconds"] = (
+            (df["order_execution_time"] - df["model_change_time"]).dt.total_seconds()
+        )
+    else:
+        df["time_delta_seconds"] = 0.0
+    return df
+
+
+def _to_iso(dt: Any) -> Any:
+    try:
+        import pandas as pd  # type: ignore
+    except Exception:  # pragma: no cover
+        pd = None
+    if isinstance(dt, datetime):
+        return dt.isoformat()
+    if pd is not None and isinstance(dt, pd.Timestamp):
+        return dt.to_pydatetime().isoformat()
+    return dt
+
+
 def load_model() -> Any:
     if not MODEL_PATH.exists():
         raise RuntimeError(f"Model not found: {MODEL_PATH}")
@@ -93,6 +120,8 @@ MASTER_MODEL = load_master_model(
     training_data_path=Path("training_data.csv"),
     historical_trading_path=Path("historical_trading_dataset.csv"),
 )
+POSITION_MODEL_PATH = Path("models/position_model.pkl")
+POSITION_MODEL = load_position_model(POSITION_MODEL_PATH)
 
 # In-memory storage for the last analysis context
 analysis_memory: Dict[str, Any] = {"recommendations": [], "summary": ""}
@@ -325,6 +354,122 @@ async def follow_up_cash(payload: CashFollowUpRequest) -> Dict[str, Any]:
     context = payload.dict()
     answer = await nl_helper.answer_cash_follow_up(payload.question, context)
     return {"answer": answer, "model": nl_helper.model}
+
+
+@app.get("/position-summrize")
+async def position_summrize(limit: int = 200, page: int = 1, page_size: int = 5) -> Dict[str, Any]:
+    """
+    Run position anomaly scoring via position_model.pkl and return per-security rows.
+    Fetches data from DB, builds feature rows, scores anomalies.
+    """
+    if POSITION_MODEL is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Position model not available. Train position_model.pkl first.",
+        )
+
+    if db_client is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Database client unavailable. Ensure python-tds is installed.",
+        )
+
+    try:
+        rows = await run_in_threadpool(db_client.fetch_position_feature_rows, limit)
+    except Exception as exc:
+        logger.exception("Failed to fetch position data: %s", exc)
+        raise HTTPException(status_code=502, detail="Failed to fetch position data from database.")
+
+    if not rows:
+        return {"rows": [], "total_rows": 0, "anomalies": 0}
+
+    df = pd.DataFrame(rows)
+    feature_cols = [
+        "model_target_percent",
+        "executed_quantity",
+        "executed_percent",
+        "allocation_after_trade",
+        "exists_in_model",
+        "drift_percent",
+        "overweight_percent",
+        "underweight_percent",
+        "order_mismatch_flag",
+        "timing_mismatch_flag",
+        "allocation_excess_flag",
+        # compute time delta if timestamps exist
+    ]
+    if "order_execution_time" in df.columns and "model_change_time" in df.columns:
+        df["order_execution_time"] = pd.to_datetime(df["order_execution_time"])
+        df["model_change_time"] = pd.to_datetime(df["model_change_time"])
+        df["time_delta_seconds"] = (
+            (df["order_execution_time"] - df["model_change_time"]).dt.total_seconds()
+        )
+    else:
+        df["time_delta_seconds"] = 0.0
+    feature_cols.append("time_delta_seconds")
+
+    for col in feature_cols:
+        if col not in df.columns:
+            df[col] = 0.0
+    df[feature_cols] = df[feature_cols].fillna(0.0)
+
+    scores = POSITION_MODEL.predict_proba(df[feature_cols])[:, 1]
+    df["score"] = scores
+    df["is_anomaly"] = (df["score"] > 0.5).astype(bool)
+
+    # Assemble output matching requested structure
+    response_rows = []
+    for _, row in df.iterrows():
+        response_rows.append(
+            {
+                "account_id": row.get("account_id"),
+                "account_short_name": row.get("account_short_name"),
+                "model_symbol": row.get("model_symbol"),
+                "model_target_percent": row.get("model_target_percent"),
+                "executed_symbol": row.get("executed_symbol"),
+                "executed_quantity": row.get("executed_quantity"),
+                "executed_percent": row.get("executed_percent"),
+                "allocation_after_trade": row.get("allocation_after_trade"),
+                "model_change_time": _to_iso(row.get("model_change_time")),
+                "order_execution_time": _to_iso(row.get("order_execution_time")),
+                "exists_in_model": row.get("exists_in_model"),
+                "drift_percent": row.get("drift_percent"),
+                "overweight_percent": row.get("overweight_percent"),
+                "underweight_percent": row.get("underweight_percent"),
+                "order_mismatch_flag": row.get("order_mismatch_flag"),
+                "timing_mismatch_flag": row.get("timing_mismatch_flag"),
+                "allocation_excess_flag": row.get("allocation_excess_flag"),
+                "score": float(row.get("score")),
+                "is_anomaly": bool(row.get("is_anomaly")),
+            }
+        )
+
+    anomalies = [r for r in response_rows if r["is_anomaly"]]
+
+    # pagination
+    if page_size <= 0:
+        page_size = 5
+    if page <= 0:
+        page = 1
+    start = (page - 1) * page_size
+    end = start + page_size
+    paged_rows = response_rows[start:end]
+
+    # Attach LLM reason per row
+    enriched_rows: List[Dict[str, Any]] = []
+    for row in paged_rows:
+        reason = await nl_helper.position_reason(row)
+        new_row = dict(row)
+        new_row["reason"] = reason
+        enriched_rows.append(new_row)
+
+    return {
+        "total_rows": len(response_rows),
+        "anomalies": len(anomalies),
+        "page": page,
+        "page_size": page_size,
+        "rows": enriched_rows,
+    }
 
 
 @app.post("/cash-analysis")

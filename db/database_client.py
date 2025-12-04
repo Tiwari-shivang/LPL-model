@@ -108,6 +108,7 @@ class DatabaseClient:
             SELECT TOP {limit}
                 Id AS account_id,
                 Description AS account_name,
+                short_name AS account_short_name,
                 TotalMarketValue AS total_market_value,
                 CashBalance AS cash_balance,
                 AvailableCash AS available_cash,
@@ -194,7 +195,7 @@ class DatabaseClient:
         }
 
     # -----------------------------------------------------------
-    # dY"1 FETCH MODEL / SLEEVE / SECURITY STRUCTURE
+    #   dY"1 FETCH MODEL / SLEEVE / SECURITY STRUCTURE
     # -----------------------------------------------------------
     def fetch_model_structures(self) -> Dict[Any, Dict[str, Any]]:
         model_rows = self._fetchall(
@@ -300,11 +301,11 @@ class DatabaseClient:
             if model_info:
                 portfolio = {"model": model_info}
 
-            enriched.append(
-                {
-                    "account_id": acc_id,
-                    "account_name": acc.get("account_name"),
-                    "market_value": mv,
+        enriched.append(
+            {
+                "account_id": acc_id,
+                "account_name": acc.get("account_name"),
+                "market_value": mv,
                     "cash_balance": cash,
                     "available_cash": float(acc.get("available_cash") or available),
                     "total_cash_available": available,
@@ -338,3 +339,158 @@ class DatabaseClient:
             )
 
         return enriched
+
+    # -----------------------------------------------------------
+    # 🔹 POSITION FEATURE ROWS (ACCOUNT x SECURITY)
+    # -----------------------------------------------------------
+    def fetch_position_feature_rows(self, limit: int = 200) -> List[Dict[str, Any]]:
+        accounts = self.fetch_accounts(limit=limit)
+        if not accounts:
+            return []
+
+        account_mv = {a["account_id"]: float(a.get("total_market_value") or 0.0) for a in accounts}
+        account_models = {a["account_id"]: a.get("model_id") for a in accounts}
+        account_short_names = {a["account_id"]: a.get("account_short_name") for a in accounts}
+
+        model_meta_rows = self._fetchall("SELECT Id, LastModifiedDate FROM Models WHERE IsDeleted = 0")
+        model_meta = {r["Id"]: r.get("LastModifiedDate") for r in model_meta_rows}
+
+        model_targets = self._fetchall(
+            """
+            SELECT 
+                ms.ModelId,
+                ms.AllocationPercentage AS sleeve_alloc,
+                ss.SecurityId,
+                ss.AllocationPercentage AS sec_alloc,
+                sec.Symbol
+            FROM ModelSleeves ms
+            JOIN SleeveSecurities ss ON ms.SleeveId = ss.SleeveId
+            JOIN Securities sec ON ss.SecurityId = sec.Id
+            WHERE ms.IsDeleted = 0 AND ss.IsDeleted = 0 AND sec.IsDeleted = 0
+            """
+        )
+        targets_map: Dict[Any, Dict[Any, Dict[str, Any]]] = {}
+        for r in model_targets:
+            model_id = r.get("ModelId")
+            sec_id = r.get("SecurityId")
+            sleeve_alloc = float(r.get("sleeve_alloc") or 0.0)
+            sec_alloc = float(r.get("sec_alloc") or 0.0)
+            target_pct = (sleeve_alloc * sec_alloc) / 10000.0  # percent scale
+            targets_map.setdefault(model_id, {})[sec_id] = {
+                "model_target_percent": target_pct,
+                "symbol": r.get("Symbol"),
+            }
+
+        orders = self._fetchall(
+            """
+            SELECT 
+                o.AccountId,
+                o.SecurityId,
+                o.FilledQuantity,
+                o.FilledPrice,
+                o.EstCost,
+                o.TradeDate AS order_execution_time,
+                sec.Symbol
+            FROM Orders o
+            JOIN Securities sec ON o.SecurityId = sec.Id
+            WHERE o.IsDeleted = 0 AND sec.IsDeleted = 0
+            """
+        )
+        orders_by_account: Dict[Any, List[Dict[str, Any]]] = {}
+        for o in orders:
+            orders_by_account.setdefault(o.get("AccountId"), []).append(o)
+
+        order_allocs_rows = self._fetchall(
+            """
+            SELECT 
+                oa.AccountId,
+                o.SecurityId,
+                oa.EndPercent,
+                oa.CurrPercent,
+                oa.ModelPercent
+            FROM OrderAllocations oa
+            JOIN Orders o ON oa.OrderId = o.Id
+            WHERE oa.IsDeleted = 0 AND o.IsDeleted = 0
+            """
+        )
+        order_allocs: Dict[Any, Dict[Any, Dict[str, float]]] = {}
+        for r in order_allocs_rows:
+            acc = r.get("AccountId")
+            sec = r.get("SecurityId")
+            order_allocs.setdefault(acc, {})[sec] = {
+                "end_percent": float(r.get("EndPercent") or 0.0),
+                "curr_percent": float(r.get("CurrPercent") or 0.0),
+                "model_percent": float(r.get("ModelPercent") or 0.0),
+            }
+
+        feature_rows: List[Dict[str, Any]] = []
+
+        for acc in accounts:
+            acc_id = acc["account_id"]
+            mv = account_mv.get(acc_id, 0.0)
+            model_id = account_models.get(acc_id)
+            acc_short_name = account_short_names.get(acc_id)
+            model_target_map = targets_map.get(model_id, {})
+            model_change_time = model_meta.get(model_id)
+
+            securities = set(model_target_map.keys())
+            for o in orders_by_account.get(acc_id, []):
+                if o.get("SecurityId") is not None:
+                    securities.add(o["SecurityId"])
+
+            for sec_id in securities:
+                model_info = model_target_map.get(sec_id, {})
+                model_target_percent = model_info.get("model_target_percent", 0.0)
+                model_symbol = model_info.get("symbol")
+
+                order = next((o for o in orders_by_account.get(acc_id, []) if o.get("SecurityId") == sec_id), None)
+                executed_symbol = order.get("Symbol") if order else model_symbol
+                filled_qty = float(order.get("FilledQuantity") or 0.0) if order else 0.0
+                filled_price = float(order.get("FilledPrice") or 0.0) if order else 0.0
+                est_cost = float(order.get("EstCost") or 0.0) if order else 0.0
+                trade_date = order.get("order_execution_time") if order else None
+
+                trade_value = filled_qty * filled_price if filled_qty and filled_price else est_cost
+                executed_percent = (trade_value / mv * 100.0) if mv > 0 else 0.0
+
+                alloc = order_allocs.get(acc_id, {}).get(sec_id, {})
+                allocation_after_trade = alloc.get("end_percent") or alloc.get("curr_percent") or executed_percent
+                model_percent_from_order = alloc.get("model_percent", model_target_percent)
+
+                drift_percent = executed_percent - model_percent_from_order
+                overweight_percent = max(drift_percent, 0.0)
+                underweight_percent = max(-drift_percent, 0.0)
+                exists_in_model = 1 if model_target_percent > 0 else 0
+                order_mismatch_flag = 1 if not exists_in_model else 0
+
+                timing_mismatch_flag = 0
+                if model_change_time and trade_date:
+                    try:
+                        timing_mismatch_flag = 1 if trade_date and trade_date > model_change_time else 0
+                    except Exception:
+                        timing_mismatch_flag = 0
+
+                allocation_excess_flag = 1 if overweight_percent > 10.0 else 0
+
+                row = {
+                    "account_id": acc_id,
+                    "account_short_name": acc_short_name,
+                    "model_symbol": model_symbol or executed_symbol,
+                    "model_target_percent": model_target_percent,
+                    "executed_symbol": executed_symbol,
+                    "executed_quantity": filled_qty,
+                    "executed_percent": executed_percent,
+                    "allocation_after_trade": allocation_after_trade,
+                    "model_change_time": model_change_time,
+                    "order_execution_time": trade_date,
+                    "exists_in_model": exists_in_model,
+                    "drift_percent": drift_percent,
+                    "overweight_percent": overweight_percent,
+                    "underweight_percent": underweight_percent,
+                    "order_mismatch_flag": order_mismatch_flag,
+                    "timing_mismatch_flag": timing_mismatch_flag,
+                    "allocation_excess_flag": allocation_excess_flag,
+                }
+                feature_rows.append(row)
+
+        return feature_rows
