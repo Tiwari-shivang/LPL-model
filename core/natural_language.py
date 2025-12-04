@@ -17,7 +17,7 @@ except ImportError:  # pragma: no cover - dependency guard
     class OpenAIError(Exception):
         ...
 
-DEFAULT_OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
+DEFAULT_OPENAI_KEY = os.getenv("OPENAI_API_KEY", "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")
 
 
 class NaturalLanguageHelper:
@@ -103,30 +103,83 @@ class NaturalLanguageHelper:
             )
 
         prompt = (
-            "Act as Warren Buffett — a world-renowned investor, financial advisor, and former broker with decades of "
-            "experience in evaluating portfolio construction, cash efficiency, liquidity behavior, and risk. Analyze "
-            "all provided account snapshots, intelligence signals, and the anomaly classifications (is_anomaly).\n\n"
-            "Your task is to provide a formal, deeply reasoned financial assessment that includes the following sections:\n\n"
-            "1. Detailed Expert Summary (Warren Buffett Style)\n"
-            "Explain the cash condition, portfolio behavior, and overall financial posture of the accounts with the calm, "
-            "long-term, principle-driven tone Warren Buffett is known for. Avoid unnecessary technical jargon. Focus on "
-            "rational analysis, capital allocation discipline, and client-first judgement.\n\n"
-            "2. Why Each is_anomaly: true Portfolio Is Anomalous\n"
-            "For every account flagged as an anomaly, clearly explain:\n"
-            "- What is unusual about its cash behavior\n"
-            "- What operational or behavioral signals are causing the anomaly\n"
-            "- Whether these issues stem from trades, deposits/withdrawals, dividends, drift, liquidity imbalance, or model deviation\n"
-            "- Any underlying structural issues (e.g., lack of reinvestment, outsized cash accumulation, unexplained drawdowns)\n"
-            "Write these explanations as if mentoring a junior advisor at Berkshire Hathaway.\n\n"
-            "3. Pattern Detection Across All Anomalies\n"
-            "Identify common threads among all is_anomaly: true accounts, such as repeated high drift behaviors, consistently elevated idle cash, sudden unexplained deposits, cash spikes after trade settlements, under-funded accounts, significant deviations from model cash targets, and unusual timing patterns. Explain why these patterns matter and what long-term implications they carry.\n\n"
-            "4. Compare Anomalous vs. Non-Anomalous Portfolios\n"
-            "Describe the differences in behavior between accounts marked is_anomaly: true vs false. Highlight what stable (normal) accounts have in common, what abnormal accounts consistently lack, and how the behaviors diverge in terms of cash efficiency and allocation discipline.\n\n"
-            "5. Key Insights (Bullet Points)\n"
-            "Provide short, essential observations Warren Buffett would highlight, focusing on cash utilization, drift and allocation alignment, liquidity patterns, trade-driven movements, advisory risks, and capital efficiency.\n\n"
-            "6. Recommendations (Warren-style Guidance)\n"
-            "Present clear, conservative, client-protective recommendations (deploy cash, trim positions, rebalance, wait due to upcoming flows, deeper review), with long-term, principle-centered advice.\n\n"
-            "Tone & Style: Formal, authoritative, calm, rational; long-term focus; avoid hype or technical noise; speak as a seasoned financial mentor; simple but deeply insightful explanations."
+            "Act as a highly experienced senior financial analyst with decades of expertise in portfolio construction, "
+    "cash efficiency, liquidity behavior, risk evaluation, and trading patterns. Analyze all provided account "
+    "snapshots, intelligence signals, and anomaly classifications (is_anomaly) and produce a clean, structured "
+    "HTML-formatted summary.\n\n"
+
+    "Your response MUST be valid HTML using <h3>, <ul>, <li>, <strong>, and <br/> tags. Keep the tone professional, "
+    "calm, rational, and insight-driven — no storytelling, no long paragraphs, and no personal names.\n\n"
+
+    "The response must include the following sections, exactly in this structure:\n\n"
+
+    "<h2>Expert Summary</h2>\n"
+    "<ul>\n"
+    "  <li><strong>Overview:</strong>\n"
+    "    <ul>\n"
+    "      <li>Short bullets explaining overall portfolio condition</li>\n"
+    "      <li>Use numbers and percentages when relevant</li>\n"
+    "    </ul>\n"
+    "  </li>\n"
+    "</ul>\n\n"
+
+    "<h3>Anomalous Accounts Explanation</h3>\n"
+    "<ul>\n"
+    "  <li><strong>Why accounts are flagged:</strong>\n"
+    "    <ul>\n"
+    "      <li>Explain unusual cash behavior</li>\n"
+    "      <li>Highlight operational or behavioral signals</li>\n"
+    "      <li>Indicate if caused by deposits, withdrawals, dividends, drift, liquidity imbalance, or model deviation</li>\n"
+    "      <li>Note structural issues such as idle cash, oversized build-up, or unusual drawdowns</li>\n"
+    "    </ul>\n"
+    "  </li>\n"
+    "</ul>\n\n"
+
+    "<h3>Pattern Detection</h3>\n"
+    "<ul>\n"
+    "  <li><strong>Common patterns across anomalies:</strong>\n"
+    "    <ul>\n"
+    "      <li>Short bullets summarizing repeated behaviors (e.g., persistent drift, high idle cash, timing patterns)</li>\n"
+    "      <li>Explain why these patterns matter, using clear financial terms</li>\n"
+    "    </ul>\n"
+    "  </li>\n"
+    "</ul>\n\n"
+
+    "<h3>Anomalous vs. Normal Accounts</h3>\n"
+    "<ul>\n"
+    "  <li><strong>Comparison:</strong>\n"
+    "    <ul>\n"
+    "      <li>Show how stable accounts behave differently from anomalous accounts</li>\n"
+    "      <li>Highlight differences in cash efficiency, drift behavior, and trading consistency</li>\n"
+    "    </ul>\n"
+    "  </li>\n"
+    "</ul>\n\n"
+
+    "<h3>Key Insights</h3>\n"
+    "<ul>\n"
+    "  <li><strong>Important observations:</strong>\n"
+    "    <ul>\n"
+    "      <li>Short, punchy bullets using advisor-friendly keywords</li>\n"
+    "      <li>Must be easy to scan and understand quickly</li>\n"
+    "    </ul>\n"
+    "  </li>\n"
+    "</ul>\n\n"
+
+    "<h3>AI Recommendations</h3>\n"
+    "<ul>\n"
+    "  <li><strong>Action items:</strong>\n"
+    "    <ul>\n"
+    "      <li>Provide 3–5 practical steps aligned with risk control, cash deployment, rebalance actions, or review needs</li>\n"
+    "      <li>Keep each item one line and actionable</li>\n"
+    "    </ul>\n"
+    "  </li>\n"
+    "</ul>\n\n"
+
+    "Rules:\n"
+    "• Output must be HTML only — no markdown.\n"
+    "• Each bullet must be short and high-value.\n"
+    "• Use digits and percentages whenever relevant.\n"
+    "• Avoid fluff and long paragraphs — focus on actionable financial insights.\n"
         )
 
         try:
@@ -141,3 +194,174 @@ class NaturalLanguageHelper:
             return resp.choices[0].message.content.strip()
         except (OpenAIError, asyncio.TimeoutError, Exception):
             return "Unable to generate portfolio-wide summary right now. Please try again shortly."
+
+    async def summarize_master(self, analysis_payload: Dict[str, Any]) -> str:
+        """
+        Summarize master-agent outputs across cash, positions, and historical trading.
+        """
+        if self.client is None:
+            return (
+                "LLM summary unavailable (OPENAI_API_KEY or openai package missing). "
+                "Review cash, position, and trading sections above."
+            )
+
+        prompt = (
+"Act as a senior portfolio analyst. Using the provided model outputs, generate a clean HTML-formatted summary "
+    "for the three sections: Cash analysis, Position analysis, and Historical Trading.\n\n"
+    "Your response MUST be valid HTML and follow this exact nested structure:\n\n"
+    "<h3>Cash analysis</h3>\n"
+    "<ul>\n"
+    "  <li><strong>What is happening:</strong>\n"
+    "    <ul>\n"
+    "      <li>short pointer using financial keywords</li>\n"
+    "      <li>short pointer with relevant digits</li>\n"
+    "    </ul>\n"
+    "  </li>\n"
+    "  <li><strong>Why this is happening:</strong>\n"
+    "    <ul>\n"
+    "      <li>root cause pointer with numeric context</li>\n"
+    "    </ul>\n"
+    "  </li>\n"
+    "  <li><strong>AI recommendations:</strong>\n"
+    "    <ul>\n"
+    "      <li>short, actionable pointer</li>\n"
+    "    </ul>\n"
+    "  </li>\n"
+    "</ul>\n\n"
+    "<h3>Position analysis</h3>\n"
+    "<ul>\n"
+    "  <li><strong>What is happening:</strong>\n"
+    "    <ul>\n"
+    "      <li>short pointer</li>\n"
+    "    </ul>\n"
+    "  </li>\n"
+    "  <li><strong>Why this is happening:</strong>\n"
+    "    <ul>\n"
+    "      <li>short root cause pointer</li>\n"
+    "    </ul>\n"
+    "  </li>\n"
+    "  <li><strong>AI recommendations:</strong>\n"
+    "    <ul>\n"
+    "      <li>short action pointer</li>\n"
+    "    </ul>\n"
+    "  </li>\n"
+    "</ul>\n\n"
+    "<h3>Historical trading</h3>\n"
+    "<ul>\n"
+    "  <li><strong>What is happening:</strong>\n"
+    "    <ul>\n"
+    "      <li>short pointer</li>\n"
+    "    </ul>\n"
+    "  </li>\n"
+    "  <li><strong>Why this is happening:</strong>\n"
+    "    <ul>\n"
+    "      <li>behavior or pattern cause pointer</li>\n"
+    "    </ul>\n"
+    "  </li>\n"
+    "  <li><strong>AI recommendations:</strong>\n"
+    "    <ul>\n"
+    "      <li>one-line corrective action</li>\n"
+    "    </ul>\n"
+    "  </li>\n"
+    "</ul>\n\n"
+    "Rules:\n"
+    "• Output MUST be a valid HTML string only — no markdown.\n"
+    "• Each list item must be short and high-value.\n"
+    "• Use financial keywords advisors understand (e.g., drift, cash drag, turnover, deviation, overweight).\n"
+    "• Include exact digits/percentages from the model output.\n"
+    "• Do NOT write long paragraphs — only structured HTML lists.\n"
+        )
+
+        try:
+            resp = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": json.dumps(analysis_payload, default=str)},
+                ],
+                temperature=0.35,
+            )
+            return resp.choices[0].message.content.strip()
+        except (OpenAIError, asyncio.TimeoutError, Exception):
+            return "Unable to generate master summary right now. Please try again shortly."
+
+    async def answer_master_follow_up(
+        self, question: str, analysis_payload: Dict[str, Any]
+    ) -> str:
+        """
+        Answer a follow-up question grounded in master agent output.
+        """
+        if self.client is None:
+            return (
+                "LLM unavailable. Please configure OPENAI_API_KEY and install openai package."
+            )
+
+        prompt = (
+            "You are a senior trader with 50+ years of experience. "
+            "Using the provided Master Agent output (cash analysis, position drift, trading activity), "
+            "answer my follow-up question with a short, high-clarity insight.\n\n"
+            "Your answer should:\n"
+            "- Stay tightly grounded in the data\n"
+            "- Highlight the key trading implication\n"
+            "- Provide a simple next step a professional would take\n"
+            "- Remain brief and avoid long explanations"
+        )
+
+        payload = {"question": question, "analysis": analysis_payload}
+
+        try:
+            resp = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": json.dumps(payload, default=str)},
+                ],
+                temperature=0.35,
+            )
+            return resp.choices[0].message.content.strip()
+        except (OpenAIError, asyncio.TimeoutError, Exception):
+            return "Unable to answer follow-up right now. Please try again shortly."
+
+    async def answer_cash_follow_up(
+        self, question: str, cash_payload: Dict[str, Any]
+    ) -> str:
+        """
+        Answer a cash-only follow-up using Buffett-style concise guidance.
+        """
+        if self.client is None:
+            return (
+                "LLM unavailable. Please configure OPENAI_API_KEY and install openai package."
+            )
+
+        prompt = (
+            "Act as 50 years experienced trader/broker, applying calm, long-term, principle-driven judgment. "
+            "Use ONLY the provided cash-analysis data to answer the follow-up question.\n\n"
+            "Your response MUST:\n"
+            "• Be short, high-value, and no more than 12 lines\n"
+            "• Include precise digits and percentages directly from the data\n"
+            "• Provide simple, investor-friendly interpretation of what the numbers mean\n"
+            "• Highlight the most important implication for capital efficiency\n"
+            "• Give exactly ONE clear next step a trader should take\n"
+            "• Use HTML-friendly formatting such as \\n, **bold**, and structured short lines\n"
+            "• Do NOT restate the entire payload; summarize only the insight\n\n"
+            "Write with Buffett’s clarity, calmness, and long-term focus."
+        )
+
+        payload = {"question": question, "cash_analysis": cash_payload}
+        user_message = (
+            f"Follow-up question: {question}\n\n"
+            f"Cash analysis data:\n{json.dumps(cash_payload, default=str)}"
+        )
+
+        try:
+            resp = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": user_message},
+                ],
+                temperature=0.25,
+            )
+            return resp.choices[0].message.content.strip()
+        except (OpenAIError, asyncio.TimeoutError, Exception):
+            return "Unable to answer cash follow-up right now. Please try again shortly."

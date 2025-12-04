@@ -4,6 +4,8 @@ joblib
 fastapi
 uvicorn
 python-socketio
-google-genai
 python-dotenv
-
+httpx
+openai
+python-tds
+xgboost

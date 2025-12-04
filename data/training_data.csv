@@ -1,7 +1,0 @@
-account_id,total_trade_amount,cash_trade_amount,cash_trade_ratio,cash_model_percent,cash_vs_model_diff,total_securities,num_sleeves
-acct-001,100000,25000,0.25,0.2,5.0,12,2
-acct-002,50000,5000,0.1,0.15,-5.0,8,1
-acct-003,200000,60000,0.3,0.25,5.0,20,3
-acct-004,75000,15000,0.2,0.22,-2.0,10,2
-acct-005,120000,40000,0.333,0.3,3.3,18,2
-

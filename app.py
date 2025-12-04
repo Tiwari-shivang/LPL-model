@@ -4,21 +4,24 @@ FastAPI + Socket.IO service that wraps Isolation Forest scoring for live anomaly
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import joblib
 import pandas as pd
-from google import genai
+import joblib
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
-from feature_extractor import extract_feature_matrix
+from core.cash_intelligence import build_cash_intelligence
+from core.natural_language import NaturalLanguageHelper
+from core.master_agent import load_master_model, score_master_agent
+from db.database_client import DatabaseClient
+from feature_extractor import FEATURE_COLUMNS, extract_feature_matrix
 
 MODEL_PATH = Path("models/iso_model.pkl")
 
@@ -33,16 +36,14 @@ def configure_logging() -> None:
 
 
 load_dotenv()
-GEMINI_API_KEY = os.getenv(
-    "GEMINI_API_KEY", "AIzaSyDC2sWF_hoNYvz3-Xm23I9_Wm3lExUf_P0"
-)
-# Set API key for google-genai client
-os.environ["GEMINI_API_KEY"] = GEMINI_API_KEY
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+db_client: Optional[DatabaseClient]
+try:
+    db_client = DatabaseClient()
+except ImportError:
+    db_client = None
+    logger.warning("python-tds not installed; database connectivity is unavailable.")
 
-
-class AccountBatch(BaseModel):
-    data: List[Dict[str, Any]]
+nl_helper = NaturalLanguageHelper(api_key=os.getenv("OPENAI_API_KEY"))
 
 
 class CashAnalysisContext(BaseModel):
@@ -52,6 +53,18 @@ class CashAnalysisContext(BaseModel):
 
 class CashAnalysisRequest(BaseModel):
     question: str
+
+
+class MasterFollowUpRequest(BaseModel):
+    question: str
+    class Config:
+        extra = "allow"
+
+
+class CashFollowUpRequest(BaseModel):
+    question: str
+    class Config:
+        extra = "allow"
 
 
 def load_model() -> Any:
@@ -71,6 +84,15 @@ app.add_middleware(
 )
 
 model = load_model()
+MASTER_MODEL_PATH = Path("models/xgb_master_model.pkl")
+MASTER_MODEL = load_master_model(
+    model_path=MASTER_MODEL_PATH,
+    logs_path=Path("synthetic_training_logs.csv"),
+    positions_path=Path("synthetic_positions_dataset.csv"),
+    position_analysis_path=Path("position_analysis_dataset.csv"),
+    training_data_path=Path("training_data.csv"),
+    historical_trading_path=Path("historical_trading_dataset.csv"),
+)
 
 # In-memory storage for the last analysis context
 analysis_memory: Dict[str, Any] = {"recommendations": [], "summary": ""}
@@ -80,106 +102,229 @@ analysis_memory: Dict[str, Any] = {"recommendations": [], "summary": ""}
 async def health() -> Dict[str, Any]:
     return {"status": "ok"}
 
+@app.get("/analyze")
+async def analyze() -> List[Dict[str, Any]]:
+    """
+    Pull accounts directly from the DB, score anomalies, and enrich with cash intelligence.
+    Clients call this endpoint with an empty body.
+    """
+    if db_client is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Database client unavailable. Ensure python-tds is installed.",
+        )
 
-def build_recommendations(
-    feature_rows: List[Dict[str, Any]],
-    predictions: List[int],
-    scores: List[float],
-    accounts: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    recommendations = []
-    for idx, (feat, pred, score, metadata) in enumerate(
-        zip(feature_rows, predictions, scores, accounts)
+    try:
+        accounts = await run_in_threadpool(db_client.fetch_enriched_accounts, 500)
+    except Exception as exc:  # pragma: no cover - runtime guard
+        logger.exception("Failed to fetch accounts from DB: %s", exc)
+        raise HTTPException(status_code=502, detail="Failed to fetch accounts from database.")
+
+    if not isinstance(accounts, list) or not accounts:
+        raise HTTPException(
+            status_code=400,
+            detail="Database returned no accounts to analyze.",
+        )
+
+    feature_rows = extract_feature_matrix(accounts)
+    df = pd.DataFrame(feature_rows)
+
+    try:
+        preds = model.predict(df[FEATURE_COLUMNS])
+        scores = model.decision_function(df[FEATURE_COLUMNS])
+    except ValueError as exc:
+        raise HTTPException(status_code=500, detail=f"Scoring failed: {exc}")
+
+    recommendations: List[Dict[str, Any]] = []
+    for idx, (feat, pred, score, snapshot) in enumerate(
+        zip(feature_rows, preds.tolist(), scores.tolist(), accounts)
     ):
         is_anomaly = pred == -1
-        reasons = []
+        intelligence = build_cash_intelligence(snapshot, feat, is_anomaly=is_anomaly)
 
-        diff = feat.get("cash_vs_model_diff", 0.0)
-        if diff > 5:
-            reasons.append("Cash allocation significantly above model")
-        elif diff < -5:
-            reasons.append("Cash allocation significantly below model")
+        reasons: List[str] = []
+        reasons.extend(intelligence.get("root_causes", []))
+        reasons.extend(intelligence.get("actions", []))
+
+        idle_days = snapshot.get("cash_idle_days")
+        last_trade_date = snapshot.get("last_trade_date")
+        days_since_last_trade = snapshot.get("days_since_last_trade")
+        if idle_days is not None:
+            reasons.append(f"Cash has been idle for ~{idle_days} days since last trade.")
+        if days_since_last_trade is not None and last_trade_date:
+            reasons.append(f"Last trade date: {str(last_trade_date)} ({days_since_last_trade} days ago).")
 
         recommendations.append(
             {
-                "accountId": metadata.get("AccountId")
-                or metadata.get("accountId")
+                "accountId": snapshot.get("account_id")
+                or snapshot.get("AccountId")
                 or f"unknown-{idx}",
-                "features": feat,
+                "cash_idle_days": idle_days,
+                "days_since_last_trade": days_since_last_trade,
+                "last_trade_date": last_trade_date,
+                "features": {
+                    **feat,
+                    "risk_score": intelligence.get("risk_score"),
+                    "severity": intelligence.get("severity"),
+                    "portfolio": snapshot.get("portfolio", {}),
+                },
                 "is_anomaly": is_anomaly,
                 "score": float(score),
                 "reasons": reasons,
                 "recommendationViewed": False,
             }
         )
-    return recommendations
 
-
-def build_gemini_prompt(question: str, context: Dict[str, Any]) -> str:
-    accounts = context.get("accounts", [])
-    summary = context.get("summary", "No summary provided.")
-
-    return f"""
-You are an experienced financial advisor specializing in portfolio management, cash allocation, and rebalancing.
-You are talking to a professional investment advisor, not the end client.
-Your job is to explain clearly, be conservative, and avoid overly aggressive risk-taking.
-
-Summary:
-{summary}
-
-Accounts:
-{accounts}
-
-User question:
-{question}
-
-Instructions:
-- Use simple, professional language.
-- Refer to accounts using their accountId where helpful.
-- Explain why the cash situation is normal or abnormal.
-- Propose specific, actionable next steps (e.g., rebalance, invest excess cash, review client objectives).
-- Do not give any tax or legal advice.
-- If information is incomplete, say what else you would like to know.
-"""
-
-
-@app.post("/analyze")
-async def analyze(file: UploadFile = File(...)) -> List[Dict[str, Any]]:
-    if file.content_type not in {"application/json", "text/json"}:
-        raise HTTPException(
-            status_code=415,
-            detail="Unsupported file type, please upload a JSON account array.",
-        )
-
-    payload = await file.read()
-    try:
-        accounts = json.loads(payload)
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid JSON: {exc}")
-
-    if not isinstance(accounts, list) or not accounts:
-        raise HTTPException(status_code=400, detail="JSON must be a non-empty array of accounts")
-
-    rows = extract_feature_matrix(accounts)
-    df = pd.DataFrame(rows)
-    try:
-        preds = model.predict(df)
-        scores = model.decision_function(df)
-    except ValueError as exc:
-        raise HTTPException(status_code=500, detail=f"Scoring failed: {exc}")
-
-    recommendations = build_recommendations(rows, preds.tolist(), scores.tolist(), accounts)
     logger.info("Generated %s recommendations", len(recommendations))
-    
+
+    # Generate a single LLM summary across all accounts (batch prompt)
+    summary_text = await nl_helper.summarize_batch(recommendations)
+
     # Store in memory for follow-up questions
     anomaly_count = sum(1 for r in recommendations if r.get("is_anomaly"))
     analysis_memory["recommendations"] = recommendations
-    analysis_memory["summary"] = (
-        f"Analyzed {len(recommendations)} accounts, "
-        f"{anomaly_count} flagged as anomalies."
+    analysis_memory["summary"] = summary_text or (
+        f"Analyzed {len(recommendations)} accounts, {anomaly_count} flagged as anomalies."
     )
-    
-    return recommendations
+
+    # Include batch summary as the first element in the response array
+    response_payload: List[Dict[str, Any]] = [{"batch_summary": analysis_memory["summary"]}]
+    response_payload.extend(recommendations)
+    return response_payload
+
+
+@app.get("/summarize")
+async def summarize() -> Dict[str, Any]:
+    """
+    Master agent summary across cash, positions, and historical trading.
+    Uses XGBoost scores plus DB signals; response grouped into three categories.
+    """
+    if db_client is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Database client unavailable. Ensure python-tds is installed.",
+        )
+
+    try:
+        accounts = await run_in_threadpool(db_client.fetch_enriched_accounts, 500)
+    except Exception as exc:
+        logger.exception("Failed to fetch accounts for summarize: %s", exc)
+        raise HTTPException(status_code=502, detail="Failed to fetch accounts from database.")
+
+    if not accounts:
+        raise HTTPException(status_code=400, detail="Database returned no accounts to summarize.")
+
+    feature_rows = extract_feature_matrix(accounts)
+    master_scores = score_master_agent(MASTER_MODEL, feature_rows)
+
+    # Build category-wise findings
+    cash_findings: List[str] = []
+    position_findings: List[str] = []
+    trading_findings: List[str] = []
+
+    high_idle = [
+        (acc, score)
+        for acc, score in zip(accounts, master_scores)
+        if acc.get("cash_idle_days") and acc.get("cash_idle_days") > 14
+    ]
+    if high_idle:
+        cash_findings.append(
+            f"{len(high_idle)} accounts show cash idle >14 days; prioritize deployment."
+        )
+
+    high_scores = [
+        (acc, s) for acc, s in zip(accounts, master_scores) if s >= 0.6
+    ]
+    if high_scores:
+        cash_findings.append(
+            f"{len(high_scores)} accounts flagged with elevated cash anomaly likelihood via XGBoost."
+        )
+
+    # Position proxy: drift signals
+    drift_issues = [
+        acc for acc in accounts if abs(acc.get("drift_percent", 0.0)) > 0.1
+    ]
+    if drift_issues:
+        position_findings.append(
+            f"{len(drift_issues)} accounts exceed 10% drift vs model targets; rebalance suggested."
+        )
+    else:
+        position_findings.append("Position alignment generally within 10% drift tolerance.")
+
+    # Historical trading
+    long_no_trade = [
+        acc for acc in accounts if acc.get("days_since_last_trade") and acc["days_since_last_trade"] > 30
+    ]
+    if long_no_trade:
+        trading_findings.append(
+            f"{len(long_no_trade)} accounts show no trades in 30+ days; review inactivity vs strategy."
+        )
+    else:
+        trading_findings.append("Trading cadence within expected ranges across accounts.")
+
+    response = {
+        "Cash_analysis": {
+            "summary": cash_findings or ["Cash activity appears stable."],
+            "sample_accounts": [
+                {
+                    "account_id": acc.get("account_id"),
+                    "cash_idle_days": acc.get("cash_idle_days"),
+                    "anomaly_score": score,
+                    "cash_after": acc.get("cash_after"),
+                    "total_cash_available": acc.get("total_cash_available"),
+                }
+                for acc, score in high_scores[:5]
+            ],
+        },
+        "Position_analysis": {
+            "summary": position_findings,
+            "sample_accounts": [
+                {
+                    "account_id": acc.get("account_id"),
+                    "drift_percent": acc.get("drift_percent"),
+                    "model_percent_target": acc.get("model_percent_target"),
+                }
+                for acc in drift_issues[:5]
+            ],
+        },
+        "Historical_Trading": {
+            "summary": trading_findings,
+            "sample_accounts": [
+                {
+                    "account_id": acc.get("account_id"),
+                    "days_since_last_trade": acc.get("days_since_last_trade"),
+                    "last_trade_date": acc.get("last_trade_date"),
+                }
+                for acc in long_no_trade[:5]
+            ],
+        },
+    }
+
+    # LLM master summary
+    response["master_summary"] = await nl_helper.summarize_master(response)
+
+    return response
+
+
+@app.post("/follow-up-master")
+async def follow_up_master(payload: MasterFollowUpRequest) -> Dict[str, Any]:
+    if not payload.question:
+        raise HTTPException(status_code=400, detail="question is required")
+
+    # Pass the entire payload (including master outputs) as context
+    context = payload.dict()
+    answer = await nl_helper.answer_master_follow_up(payload.question, context)
+    return {"answer": answer, "model": nl_helper.model}
+
+
+@app.post("/follow-up-cash")
+async def follow_up_cash(payload: CashFollowUpRequest) -> Dict[str, Any]:
+    if not payload.question:
+        raise HTTPException(status_code=400, detail="question is required")
+
+    context = payload.dict()
+    answer = await nl_helper.answer_cash_follow_up(payload.question, context)
+    return {"answer": answer, "model": nl_helper.model}
 
 
 @app.post("/cash-analysis")
@@ -192,35 +337,13 @@ async def cash_analysis(payload: CashAnalysisRequest) -> Dict[str, Any]:
         )
     
     try:
-        # Build context from memory
-        context = {
-            "accounts": analysis_memory["recommendations"],
-            "summary": analysis_memory["summary"]
-        }
-        
-        prompt = build_gemini_prompt(question=payload.question, context=context)
-        
-        # Use new google-genai client API
-        response = gemini_client.models.generate_content(
-            model="gemini-2.0-flash-exp",
-            contents=prompt
+        answer_text = await nl_helper.answer_follow_up(
+            payload.question,
+            recommendations=analysis_memory["recommendations"],
+            summary=analysis_memory["summary"],
         )
-        
-        # Extract text from response
-        answer_text = response.text if hasattr(response, "text") else str(response)
-        
-        logger.info("Gemini analysis completed for question: %s", payload.question[:50])
-        return {"answer": answer_text, "model": "gemini-2.0-flash-exp"}
-    except Exception as exc:
-        error_msg = str(exc)
-        logger.exception("Gemini cash analysis failed: %s", exc)
-        
-        # Handle RESOURCE_EXHAUSTED (429) errors with generic message
-        if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
-            raise HTTPException(
-                status_code=429,
-                detail="Resource exhausted. API quota exceeded. Please try again later."
-            )
-        
-        # Handle other errors
-        raise HTTPException(status_code=500, detail="Cash analysis failed. Please try again.")
+        logger.info("OpenAI analysis completed for question: %s", payload.question[:50])
+        return {"answer": answer_text, "model": nl_helper.model}
+    except Exception as exc:  # pragma: no cover - safety net
+        logger.exception("Cash_analysis failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Cash_analysis failed. Please try again.")

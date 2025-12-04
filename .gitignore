@@ -1,0 +1,5 @@
+data/*.csv
+*_dataset.csv
+*_training_data.csv
+synthetic_*.csv
+*_logs.csv
